@@ -11,11 +11,17 @@ from flask import Flask, jsonify, request
 import time
 import uuid
 from datetime import datetime
+from redis import Redis
+from tasks import send_notification
+import os
+from rq.job import Job
 
 app = Flask(__name__)
 
 # In-memory store for notifications
 notifications = {}
+
+redis_conn = Redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
 
 
 def send_notification_sync(notification_id, email, message):
@@ -73,20 +79,32 @@ def create_notification():
     email = data['email']
     message = data.get('message', 'You have a new notification!')
 
-    # THIS IS THE PROBLEM: We block here for 3 seconds!
-    # The user can't do anything while we wait.
-    result = send_notification_sync(notification_id, email, message)
+    job = send_notification.delay(notification_id, email, message)
 
-    notification = {
-        "id": notification_id,
-        "email": email,
-        "message": message,
-        "status": result['status'],
-        "sent_at": result['sent_at']
+    return {
+        "job_id": job.id,
+        "status": "Queued"
+    }, 202
+
+
+@app.get('/jobs/<job_id>')
+def get_job_status(job_id):
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        return {"error": "Job not found"}, 404
+    
+    response = {
+        "job_id": job_id,
+        "status": job.get_status()
     }
-    notifications[notification_id] = notification
 
-    return jsonify(notification), 201
+    if job.is_finished:
+        response["result"] = job.result
+    elif job.is_failed:
+        response["error"] = str(job.exc_info)
+    
+    return response
 
 
 @app.route('/notifications', methods=['GET'])
